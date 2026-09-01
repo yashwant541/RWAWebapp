@@ -1114,26 +1114,44 @@ def lookups_from_sample(analysis: Dict[str, Any], file_bytes: bytes) -> Dict[str
 
 A comparison rule (configured in the Admin UI) is::
 
-    { "left": "<computed column>", "right": "<other column>",
+    { "left": ["<col>", ...], "right": ["<col>", ...],
       "type": "numeric" | "text", "tolerance": 0.01 }
 
-For each row of each file every rule is evaluated; the row is *matched* only when all
-rules pass. ``build_comparison_workbook`` returns one ``.xlsx`` with ``Matched``,
-``Mismatched`` and ``Summary`` sheets.
+``left`` / ``right`` may be a single column or a list; columns are paired by position
+(1st↔1st, 2nd↔2nd …) and a single column on one side is broadcast against several on the
+other.
+
+``build_comparison_workbook`` returns one ``.xlsx``:
+  * **Summary**   – per file: rows, matched rows, mismatched rows, checks, diffs
+  * **Matched**   – one row per column-pair that agreed, WITH the actual values
+  * **Mismatched**– one row per column-pair that differed, WITH the actual values
+  * **Issues**    – compared columns that came out entirely empty for a file
+  * **_meta**     – generation time + rule list
 """
 
 
 import io
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import openpyxl
 
+DETAIL_COLUMNS = ["source_file", "row", "left_col", "left_val",
+                  "right_col", "right_val", "delta", "status"]
+
 
 def _num(x):
     return pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
+
+
+def _clean(v):
+    if v is None:
+        return None
+    if isinstance(v, float) and np.isnan(v):
+        return None
+    return v.item() if hasattr(v, "item") else v
 
 
 def _cmp_cell(left: Any, right: Any, rule: Dict[str, Any]) -> Tuple[bool, float]:
@@ -1160,9 +1178,6 @@ def _as_list(v) -> List[str]:
 
 
 def rule_pairs(rule: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """A rule's ``left`` / ``right`` may each be a single column or a list. Columns are
-    paired by position (1st↔1st, 2nd↔2nd …); a single column on one side is broadcast
-    against every column on the other."""
     lefts, rights = _as_list(rule.get("left")), _as_list(rule.get("right"))
     if len(lefts) == 1 and len(rights) > 1:
         lefts = lefts * len(rights)
@@ -1171,67 +1186,97 @@ def rule_pairs(rule: Dict[str, Any]) -> List[Tuple[str, str]]:
     return [(l, r) for l, r in zip(lefts, rights) if l and r]
 
 
+def _all_pairs(rules: List[Dict[str, Any]]) -> List[Tuple[str, str, Dict[str, Any]]]:
+    return [(l, r, rule) for rule in rules for l, r in rule_pairs(rule)]
+
+
 def compare_file(filename: str, values_df: pd.DataFrame,
-                 rules: List[Dict[str, Any]], key_columns: List[str] | None = None
-                 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    matched: List[Dict[str, Any]] = []
-    mismatched: List[Dict[str, Any]] = []
+                 rules: List[Dict[str, Any]],
+                 key_columns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Return one detail dict per (row, column-pair). ``status`` is
+    ``match`` / ``diff`` / ``column missing``."""
     key_columns = [k for k in (key_columns or []) if k in values_df.columns]
+    pairs = _all_pairs(rules)
+    detail: List[Dict[str, Any]] = []
 
     for pos, (_, row) in enumerate(values_df.iterrows()):
         excel_row = pos + 2
-        key_part = {f"key:{k}": row.get(k) for k in key_columns}
-        row_ok = True
-        row_details: List[Dict[str, Any]] = []
-        pairs = [(lc, rc, rule) for rule in rules for lc, rc in rule_pairs(rule)]
+        key_part = {f"key:{k}": _clean(row.get(k)) for k in key_columns}
         for lcol, rcol, rule in pairs:
+            rec = {"source_file": filename, "row": excel_row, **key_part,
+                   "left_col": lcol, "right_col": rcol}
             if lcol not in values_df.columns or rcol not in values_df.columns:
-                row_ok = False
-                row_details.append({"rule": f"{lcol} vs {rcol}", "status": "column missing"})
+                missing = [c for c in (lcol, rcol) if c not in values_df.columns]
+                detail.append({**rec, "left_val": None, "right_val": None, "delta": None,
+                               "status": "column missing: " + ", ".join(missing)})
                 continue
             ok, delta = _cmp_cell(row.get(lcol), row.get(rcol), rule)
-            row_ok = row_ok and ok
-            row_details.append({
-                "rule": f"{lcol} vs {rcol}", "status": "ok" if ok else "diff",
-                "left_col": lcol, "left_val": row.get(lcol),
-                "right_col": rcol, "right_val": row.get(rcol),
+            detail.append({
+                **rec,
+                "left_val": _clean(row.get(lcol)),
+                "right_val": _clean(row.get(rcol)),
                 "delta": None if (isinstance(delta, float) and np.isnan(delta)) else delta,
+                "status": "match" if ok else "diff",
             })
-        base = {"source_file": filename, "row": excel_row, **key_part}
-        if row_ok:
-            matched.append({**base, **{d["rule"]: "ok" for d in row_details}})
-        else:
-            for d in row_details:
-                if d["status"] != "ok":
-                    mismatched.append({**base, **d})
-    return matched, mismatched
+    return detail
+
+
+def _empty_column_issues(filename: str, values_df: pd.DataFrame,
+                         rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flag compared columns that exist but are entirely blank for this file - the usual
+    sign that a computed column's Python expression evaluated to nothing."""
+    issues = []
+    cols = {c for l, r, _ in _all_pairs(rules) for c in (l, r)}
+    for c in sorted(cols):
+        if c in values_df.columns and len(values_df) and values_df[c].isna().all():
+            issues.append({"source_file": filename, "column": c,
+                           "note": "column is present but every value is empty - "
+                                   "check this column's Python expression in Admin"})
+    return issues
 
 
 def run_comparison(files: List[Tuple[str, pd.DataFrame]], recipe: Dict[str, Any]
                    ) -> Dict[str, pd.DataFrame]:
     rules = recipe.get("comparison", [])
     key_columns = recipe.get("comparison_keys", [])
-    all_matched: List[Dict[str, Any]] = []
-    all_mismatched: List[Dict[str, Any]] = []
+    key_cols_present = [f"key:{k}" for k in key_columns]
+
+    detail_rows: List[Dict[str, Any]] = []
     summary: List[Dict[str, Any]] = []
+    issues: List[Dict[str, Any]] = []
 
     for filename, vdf in files:
-        m, mm = compare_file(filename, vdf, rules, key_columns)
-        all_matched.extend(m)
-        all_mismatched.extend(mm)
-        mismatch_rows = {(d["source_file"], d["row"]) for d in mm}
+        d = compare_file(filename, vdf, rules, key_columns)
+        detail_rows.extend(d)
+        issues.extend(_empty_column_issues(filename, vdf, rules))
+
+        by_row: Dict[Any, List[str]] = {}
+        for rec in d:
+            by_row.setdefault(rec["row"], []).append(rec["status"])
+        matched_rows = sum(1 for st in by_row.values() if all(s == "match" for s in st))
         summary.append({
             "source_file": filename,
             "rows": len(vdf),
-            "matched_rows": len(m),
-            "mismatched_rows": len(mismatch_rows),
-            "mismatch_findings": len(mm),
+            "matched_rows": matched_rows,
+            "mismatched_rows": len(by_row) - matched_rows,
+            "checks": len(d),
+            "diffs": sum(1 for rec in d if rec["status"] != "match"),
         })
 
+    cols = ([c for c in DETAIL_COLUMNS[:2]] + key_cols_present + DETAIL_COLUMNS[2:])
+    detail = pd.DataFrame(detail_rows)
+    if not detail.empty:
+        detail = detail.reindex(columns=[c for c in cols if c in detail.columns]
+                                + [c for c in detail.columns if c not in cols])
+
+    matched = detail[detail["status"] == "match"] if not detail.empty else detail
+    mismatched = detail[detail["status"] != "match"] if not detail.empty else detail
+
     return {
-        "Matched": pd.DataFrame(all_matched),
-        "Mismatched": pd.DataFrame(all_mismatched),
         "Summary": pd.DataFrame(summary),
+        "Matched": matched.reset_index(drop=True),
+        "Mismatched": mismatched.reset_index(drop=True),
+        "Issues": pd.DataFrame(issues),
     }
 
 
@@ -1240,18 +1285,17 @@ def build_comparison_workbook(files: List[Tuple[str, pd.DataFrame]],
     sheets = run_comparison(files, recipe)
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    order = ["Summary", "Matched", "Mismatched"]
-    for name in order:
+    for name in ("Summary", "Matched", "Mismatched", "Issues"):
         frame = sheets.get(name, pd.DataFrame())
         ws = wb.create_sheet(title=name)
-        if frame.empty:
+        if frame is None or frame.empty:
             ws.append([f"(no {name.lower()} rows)"])
             continue
         ws.append(list(frame.columns))
         for _, row in frame.iterrows():
             ws.append([
-                None if (isinstance(v, float) and np.isnan(v)) else
-                (v.item() if hasattr(v, "item") else v)
+                None if (isinstance(v, float) and np.isnan(v))
+                else (v.item() if hasattr(v, "item") else v)
                 for v in row.values
             ])
     meta = wb.create_sheet(title="_meta")
@@ -2013,31 +2057,48 @@ def run_compare(cat_id):
     in_folder = recipe["folders"]["input"]
     lookups = Lookups(recipe.get("lookup_tables") or {})
 
+    inputs_by_stem = {_stem(i["name"]): i for i in list_files(in_folder)}
     files = []
+    notes = []
     for item in list_files(out_folder):
         if not item["name"].endswith(COMPUTED_SUFFIX):
             continue
         stem = _stem(item["name"])
-        try:
-            cached = read_file(out_folder, f"/{CACHE_DIR}/{stem}.json")
-            vdf = pd.read_json(io.BytesIO(cached), orient="split")
-        except Exception:  # noqa: BLE001 - recompute from the matching input
-            src = next((i for i in list_files(in_folder) if _stem(i["name"]) == stem), None)
-            if not src:
+        vdf = None
+        # 1. recompute from the source input so results reflect the CURRENT recipe
+        src = inputs_by_stem.get(stem)
+        if src:
+            try:
+                df, _ = read_table(read_file(in_folder, src["path"]), src["name"])
+                if validate_schema(list(df.columns), recipe["canonical_schema"])["ok"]:
+                    vdf = evaluate(df, recipe, lookups)
+                    for e in vdf.attrs.get("compute_errors", []):
+                        notes.append(f"{src['name']}: {e}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"{src['name']}: {exc}")
+        # 2. fall back to the cached values written at compute time
+        if vdf is None:
+            try:
+                cached = read_file(out_folder, f"/{CACHE_DIR}/{stem}.json")
+                vdf = pd.read_json(io.BytesIO(cached), orient="split")
+                notes.append(f"{item['name']}: source input not available, used cached "
+                             "values from the last compute")
+            except Exception:  # noqa: BLE001
+                notes.append(f"{item['name']}: skipped (no source input, no cached values)")
                 continue
-            df, _ = read_table(read_file(in_folder, src["path"]), src["name"])
-            vdf = evaluate(df, recipe, lookups)
         files.append((item["name"], vdf))
 
     if not files:
         return _err("no computed outputs found - run compute first")
+    result = run_comparison(files, recipe)
     wb = build_comparison_workbook(files, recipe)
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     name = f"comparison__{ts}.xlsx"
     write_file(out_folder, "/" + name, wb)
-    summary = run_comparison(files, recipe)["Summary"]
+    issues = json.loads(result["Issues"].to_json(orient="records")) if not result["Issues"].empty else []
     return jsonify({"ok": True, "output": name,
-                    "summary": json.loads(summary.to_json(orient="records"))})
+                    "summary": json.loads(result["Summary"].to_json(orient="records")),
+                    "issues": issues, "notes": notes})
 
 
 @app.route("/api/category/<cat_id>/download", methods=["GET"])

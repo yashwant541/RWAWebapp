@@ -293,9 +293,13 @@
         el("td", { text: s.rows }),
         el("td", { text: s.matched_rows }),
         el("td", {}, [el("span", { class: "pill " + (s.mismatched_rows ? "err" : "ok"), text: s.mismatched_rows })]),
-        el("td", { text: s.mismatch_findings }),
+        el("td", { text: s.diffs != null ? s.diffs : s.mismatch_findings }),
       ])));
-      $("#compare-download").appendChild(el("button", { class: "btn", text: "Download " + r.output,
+      const dlBox = $("#compare-download");
+      (r.issues || []).forEach((i) => dlBox.appendChild(el("div", { class: "warnbox",
+        text: `⚠ ${i.source_file}: column “${i.column}” is empty — ${i.note}` })));
+      (r.notes || []).forEach((n) => dlBox.appendChild(el("div", { class: "warnbox", text: "• " + n })));
+      dlBox.appendChild(el("button", { class: "btn", text: "Download " + r.output,
         onclick: () => dl("output", "/" + r.output) }));
     } catch (e) { $("#compare-status").innerHTML = "<span class='err'>" + e.message + "</span>"; }
   }
