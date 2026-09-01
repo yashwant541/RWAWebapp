@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import traceback
 from datetime import datetime
 from functools import wraps
@@ -268,6 +269,9 @@ def admin_save_recipe(cat_id):
     return jsonify({"ok": True, "recipe": recipe, "problems": problems})
 
 
+_TOK_REF_RE = re.compile(r"\{tok:([^}]+)\}")
+
+
 def _check_references(recipe):
     canon = {c.lower() for c in recipe.get("canonical_schema", [])}
     comp = {c["name"].lower() for c in recipe.get("computed_columns", [])}
@@ -284,11 +288,30 @@ def _check_references(recipe):
             if tl in canon or tl in comp or tok in lookups or tok in toggles:
                 continue
             problems.append(f"{c['name']}: unresolved reference '{tok}' (define a toggle?)")
+        # a same-sheet cell (e.g. IF($AB$2="Yes",...)) was templated into {tok:Name} -
+        # make sure that toggle still exists (it may have been renamed/removed since).
+        for tok in _TOK_REF_RE.findall(c.get("excel_formula", "")):
+            if tok not in toggles:
+                problems.append(
+                    f"{c['name']}: formula uses toggle '{tok}' which is not defined "
+                    "(it may have been renamed) - fix the toggle name or the formula"
+                )
     for rule in recipe.get("comparison", []):
         for side in ("left", "right"):
-            col = (rule.get(side) or "").lower()
-            if col and col not in canon and col not in comp:
-                problems.append(f"comparison: column '{rule.get(side)}' does not exist")
+            raw = rule.get(side) or []
+            cols = raw if isinstance(raw, list) else [raw]
+            for col in cols:
+                if col and str(col).lower() not in canon and str(col).lower() not in comp:
+                    problems.append(f"comparison: column '{col}' does not exist")
+        lefts = rule.get("left") or []
+        rights = rule.get("right") or []
+        lefts = lefts if isinstance(lefts, list) else [lefts]
+        rights = rights if isinstance(rights, list) else [rights]
+        if len(lefts) > 1 and len(rights) > 1 and len(lefts) != len(rights):
+            problems.append(
+                f"comparison: {len(lefts)} left column(s) but {len(rights)} right "
+                "column(s) - they are paired by position, so the counts must match"
+            )
     return problems
 
 
@@ -333,7 +356,7 @@ def validate_inputs(cat_id):
     for item in cs.list_files(folder):
         try:
             data = cs.read_file(folder, item["path"])
-            df, hr = compute.read_table(data, item["name"])
+            df, hr = compute.read_table(data, item["name"], recipe["canonical_schema"])
             v = compute.validate_schema(list(df.columns), recipe["canonical_schema"])
             results.append({"file": item["name"], "header_row": hr, "rows": len(df), **v})
         except Exception as exc:  # noqa: BLE001
@@ -361,7 +384,7 @@ def run_compute(cat_id):
             continue
         try:
             data = cs.read_file(in_folder, item["path"])
-            df, _ = compute.read_table(data, item["name"])
+            df, _ = compute.read_table(data, item["name"], recipe["canonical_schema"])
             v = compute.validate_schema(list(df.columns), recipe["canonical_schema"])
             if not v["ok"]:
                 results.append({"file": item["name"], "ok": False, "message": v["message"]})
@@ -396,31 +419,49 @@ def run_compare(cat_id):
     in_folder = recipe["folders"]["input"]
     lookups = compute.Lookups(recipe.get("lookup_tables") or {})
 
+    inputs_by_stem = {_stem(i["name"]): i for i in cs.list_files(in_folder)}
     files = []
+    notes = []
     for item in cs.list_files(out_folder):
         if not item["name"].endswith(COMPUTED_SUFFIX):
             continue
         stem = _stem(item["name"])
-        try:
-            cached = cs.read_file(out_folder, f"/{CACHE_DIR}/{stem}.json")
-            vdf = pd.read_json(io.BytesIO(cached), orient="split")
-        except Exception:  # noqa: BLE001 - recompute from the matching input
-            src = next((i for i in cs.list_files(in_folder) if _stem(i["name"]) == stem), None)
-            if not src:
+        vdf = None
+        # 1. recompute from the source input so results reflect the CURRENT recipe
+        src = inputs_by_stem.get(stem)
+        if src:
+            try:
+                df, _ = compute.read_table(cs.read_file(in_folder, src["path"]), src["name"],
+                                           recipe["canonical_schema"])
+                if compute.validate_schema(list(df.columns), recipe["canonical_schema"])["ok"]:
+                    vdf = compute.evaluate(df, recipe, lookups)
+                    for e in vdf.attrs.get("compute_errors", []):
+                        notes.append(f"{src['name']}: {e}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"{src['name']}: {exc}")
+        # 2. fall back to the cached values written at compute time
+        if vdf is None:
+            try:
+                cached = cs.read_file(out_folder, f"/{CACHE_DIR}/{stem}.json")
+                vdf = pd.read_json(io.BytesIO(cached), orient="split")
+                notes.append(f"{item['name']}: source input not available, used cached "
+                             "values from the last compute")
+            except Exception:  # noqa: BLE001
+                notes.append(f"{item['name']}: skipped (no source input, no cached values)")
                 continue
-            df, _ = compute.read_table(cs.read_file(in_folder, src["path"]), src["name"])
-            vdf = compute.evaluate(df, recipe, lookups)
         files.append((item["name"], vdf))
 
     if not files:
         return _err("no computed outputs found - run compute first")
+    result = compare.run_comparison(files, recipe)
     wb = compare.build_comparison_workbook(files, recipe)
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     name = f"comparison__{ts}.xlsx"
     cs.write_file(out_folder, "/" + name, wb)
-    summary = compare.run_comparison(files, recipe)["Summary"]
+    issues = json.loads(result["Issues"].to_json(orient="records")) if not result["Issues"].empty else []
     return jsonify({"ok": True, "output": name,
-                    "summary": json.loads(summary.to_json(orient="records"))})
+                    "summary": json.loads(result["Summary"].to_json(orient="records")),
+                    "issues": issues, "notes": notes})
 
 
 @app.route("/api/category/<cat_id>/download", methods=["GET"])

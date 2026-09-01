@@ -742,9 +742,26 @@ _A1_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?(\d+)$")
 _TOK_RE = re.compile(r"\{tok:([^}]+)\}")
 
 
+_SCAN_ROWS = 60
+
+
+def _nkey(s: Any) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip().lower() if s is not None else ""
+
+
 # --------------------------------------------------------------------------- input IO
-def read_table(file_bytes: bytes, filename: str) -> Tuple[pd.DataFrame, int]:
-    """Read csv / xls / xlsx into a DataFrame, auto-detecting the header row."""
+def read_table(file_bytes: bytes, filename: str,
+               expected_columns: Optional[List[str]] = None) -> Tuple[pd.DataFrame, int]:
+    """Read csv / xls / xlsx into a DataFrame.
+
+    When ``expected_columns`` (the category's canonical schema) is given, the table is
+    located by NAME: the header row is the one matching the most canonical names, and only
+    the columns spanning those matched headers are kept. Anything sitting elsewhere on the
+    sheet - a toggle/parameter cell like ``$AB$2``, notes, a totals block - is left out, so
+    it can't be mistaken for an extra column and fail the schema check.
+
+    Without ``expected_columns`` it falls back to generic header auto-detection.
+    """
     name = (filename or "").lower()
     if name.endswith(".csv") or name.endswith(".txt"):
         raw = pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=object,
@@ -756,12 +773,35 @@ def read_table(file_bytes: bytes, filename: str) -> Tuple[pd.DataFrame, int]:
         rows = raw.values.tolist()
     if not rows:
         raise ValueError(f"{filename}: no rows found")
-    hr = detect_header_row([[None if pd.isna(c) else c for c in r] for r in rows])
+    rows = [[None if pd.isna(c) else c for c in r] for r in rows]
+
+    if expected_columns:
+        want = {_nkey(c) for c in expected_columns}
+        scored = [
+            (sum(1 for c in row if _nkey(c) in want), -i, i)
+            for i, row in enumerate(rows[:_SCAN_ROWS])
+        ]
+        hits, _, hr = max(scored)
+        if hits > 0:
+            matched = [j for j, c in enumerate(rows[hr]) if _nkey(c) in want]
+            lo, hi = min(matched), max(matched)
+            headers = _headers_from_row([c for c in rows[hr][lo:hi + 1]])
+            # the table is the contiguous block under the header - stop at the first
+            # blank row (which normally separates it from a totals/notes block below).
+            body = []
+            for r in rows[hr + 1:]:
+                cells = r[lo:hi + 1]
+                if not any(_norm(c) for c in cells):
+                    break
+                body.append(cells)
+            df = pd.DataFrame(body, columns=headers)
+            return df.reset_index(drop=True), hr
+        # no canonical header found: return the generic read so validate_schema can
+        # report a clear "missing / unexpected" message rather than a crash.
+
+    hr = detect_header_row(rows)
     headers = _headers_from_row(rows[hr])
-    body = rows[hr + 1:]
-    df = pd.DataFrame(body, columns=headers)
-    df = df.dropna(axis=0, how="all").reset_index(drop=True)
-    # trim trailing all-empty columns produced by ragged sheets
+    df = pd.DataFrame(rows[hr + 1:], columns=headers).dropna(axis=0, how="all").reset_index(drop=True)
     df = df.loc[:, [not (h.startswith("Column") and df[h].isna().all()) for h in df.columns]]
     return df, hr
 
@@ -2110,7 +2150,7 @@ def validate_inputs(cat_id):
     for item in list_files(folder):
         try:
             data = read_file(folder, item["path"])
-            df, hr = read_table(data, item["name"])
+            df, hr = read_table(data, item["name"], recipe["canonical_schema"])
             v = validate_schema(list(df.columns), recipe["canonical_schema"])
             results.append({"file": item["name"], "header_row": hr, "rows": len(df), **v})
         except Exception as exc:  # noqa: BLE001
@@ -2138,7 +2178,7 @@ def run_compute(cat_id):
             continue
         try:
             data = read_file(in_folder, item["path"])
-            df, _ = read_table(data, item["name"])
+            df, _ = read_table(data, item["name"], recipe["canonical_schema"])
             v = validate_schema(list(df.columns), recipe["canonical_schema"])
             if not v["ok"]:
                 results.append({"file": item["name"], "ok": False, "message": v["message"]})
@@ -2185,7 +2225,8 @@ def run_compare(cat_id):
         src = inputs_by_stem.get(stem)
         if src:
             try:
-                df, _ = read_table(read_file(in_folder, src["path"]), src["name"])
+                df, _ = read_table(read_file(in_folder, src["path"]), src["name"],
+                                           recipe["canonical_schema"])
                 if validate_schema(list(df.columns), recipe["canonical_schema"])["ok"]:
                     vdf = evaluate(df, recipe, lookups)
                     for e in vdf.attrs.get("compute_errors", []):
