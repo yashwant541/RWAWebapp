@@ -42,6 +42,24 @@ def _cmp_cell(left: Any, right: Any, rule: Dict[str, Any]) -> Tuple[bool, float]
     return ls == rs, 0.0 if ls == rs else float("nan")
 
 
+def _as_list(v) -> List[str]:
+    if v is None:
+        return []
+    return [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
+
+
+def rule_pairs(rule: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """A rule's ``left`` / ``right`` may each be a single column or a list. Columns are
+    paired by position (1st↔1st, 2nd↔2nd …); a single column on one side is broadcast
+    against every column on the other."""
+    lefts, rights = _as_list(rule.get("left")), _as_list(rule.get("right"))
+    if len(lefts) == 1 and len(rights) > 1:
+        lefts = lefts * len(rights)
+    if len(rights) == 1 and len(lefts) > 1:
+        rights = rights * len(lefts)
+    return [(l, r) for l, r in zip(lefts, rights) if l and r]
+
+
 def compare_file(filename: str, values_df: pd.DataFrame,
                  rules: List[Dict[str, Any]], key_columns: List[str] | None = None
                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -54,8 +72,8 @@ def compare_file(filename: str, values_df: pd.DataFrame,
         key_part = {f"key:{k}": row.get(k) for k in key_columns}
         row_ok = True
         row_details: List[Dict[str, Any]] = []
-        for rule in rules:
-            lcol, rcol = rule.get("left"), rule.get("right")
+        pairs = [(lc, rc, rule) for rule in rules for lc, rc in rule_pairs(rule)]
+        for lcol, rcol, rule in pairs:
             if lcol not in values_df.columns or rcol not in values_df.columns:
                 row_ok = False
                 row_details.append({"rule": f"{lcol} vs {rcol}", "status": "column missing"})
@@ -128,8 +146,9 @@ def build_comparison_workbook(files: List[Tuple[str, pd.DataFrame]],
     meta = wb.create_sheet(title="_meta")
     meta.append(["generated", datetime.utcnow().isoformat() + "Z"])
     meta.append(["category", recipe.get("name", recipe.get("id", ""))])
-    meta.append(["rules", "; ".join(f"{r.get('left')} vs {r.get('right')}"
-                                    for r in recipe.get("comparison", []))])
+    meta.append(["rules", "; ".join(
+        f"{l} vs {r}" for rule in recipe.get("comparison", []) for l, r in rule_pairs(rule)
+    )])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
