@@ -17,7 +17,7 @@ from datetime import datetime
 from functools import wraps
 
 import pandas as pd
-from flask import request, jsonify, send_file
+from flask import request, jsonify, Response
 
 from webapp_core import auth, config_store as cs
 from webapp_core import sample_parser, compute, compare
@@ -36,6 +36,29 @@ COMPUTED_SUFFIX = "__computed.xlsx"
 # --------------------------------------------------------------------------- helpers
 def _err(msg, code=400):
     return jsonify({"ok": False, "error": str(msg)}), code
+
+
+_MIME = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".csv": "text/csv",
+    ".json": "application/json",
+}
+
+
+def _send_bytes(data, filename):
+    """Return a file download. Plain Response so it works on any Flask / Python version
+    (send_file's keyword for the download name changed across 1.x / 2.x / 2.3)."""
+    ext = ("." + filename.rsplit(".", 1)[1].lower()) if "." in filename else ""
+    safe = filename.replace('"', "").replace("\n", "").replace("\r", "")
+    return Response(
+        bytes(data),
+        mimetype=_MIME.get(ext, "application/octet-stream"),
+        headers={
+            "Content-Disposition": 'attachment; filename="%s"' % safe,
+            "Content-Length": str(len(data)),
+        },
+    )
 
 
 def _settings():
@@ -414,8 +437,7 @@ def download(cat_id):
         data = cs.read_file(folder, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"not found: {exc}", 404)
-    return send_file(io.BytesIO(data), as_attachment=True,
-                     download_name=_base_name(path))
+    return _send_bytes(data, _base_name(path))
 
 
 @app.route("/api/category/<cat_id>/delete", methods=["POST"])
