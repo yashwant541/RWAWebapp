@@ -1,108 +1,177 @@
 # Category Formula Studio — Dataiku webapp
 
-A **Standard** Dataiku webapp (HTML/CSS/JS + Python Flask backend) that turns a sample
-Excel workbook into a reusable "recipe" per category, then bulk-processes input files:
-validate → compute (live Excel formulas) → per-file outputs + templates → row-level
-comparison → consolidated Matched/Mismatched workbook. Includes an admin console.
+A **Standard** Dataiku webapp (HTML/CSS/JS + Python Flask backend). An admin uploads a
+sample Excel workbook per category; the app derives a reusable "recipe" (schema, Excel
+formulas, lookups, toggles, comparison rules). Users then bulk-upload input files and run
+**validate → compute (live Excel formulas) → per-file outputs + templates → row-level
+comparison**. Files can be downloaded and deleted from the UI.
 
 ```
 webapp/
-  body.html            → paste into the webapp HTML pane
-  style.css            → paste into the webapp CSS pane
-  app.js               → paste into the webapp JS pane
-  backend.py           → paste into the webapp Python pane
-  python-lib/webapp_core/   → add to the project libraries (see step 2)
+  body.html            → HTML pane
+  style.css            → CSS pane
+  app.js               → JS pane
+  backend_single.py    → Python pane  (everything in one file — use this)
+  backend.py + python-lib/webapp_core/   → the same code, split (optional, advanced)
+  build_single.py      → regenerates backend_single.py from the split modules
   tests/               → local pytest suite (not deployed)
 ```
 
-## 1. Create the managed folders
+---
 
-All storage is Dataiku **managed folders**.
+## ⚠️ About the "config JSON" — you do NOT create it
 
-| Purpose | How many | Notes |
+There is **no JSON file to write by hand**. The config managed folder starts **empty**.
+The first time the webapp backend runs it *creates* `app_settings.json` inside it (admin
+login + the 9 category names). Every time you save a recipe in the Admin page it *creates*
+`category_A.json`, `category_B.json`, … automatically.
+
+The only thing you must do is: **create an empty managed folder** and tell the backend its
+ID via a **project variable**. That's it.
+
+---
+
+## Step 1 — Create the managed folders
+
+In the **Flow**, click **+ (New)** → **Folder** (a "Managed folder"). Pick any connection
+(the project's default filesystem/cloud connection is fine). Create these:
+
+| Folder | Name suggestion | Purpose |
 |---|---|---|
-| **Config** | 1 (shared) | Holds `app_settings.json` + `category_<id>.json` recipes + `samples/`. |
-| **Input** | 1 per category | Where users upload input files. |
-| **Mapping** | 1 per category | Human-readable CSV mirror of the lookup tables. |
-| **Output** | 1 per category | Per-file computed workbooks + the comparison workbook + `_cache/`. |
-| **Template** | 1 per category | Copy of each computed workbook. |
+| Config | `webapp_config` | Holds the auto-generated settings + recipe JSON. **Leave it empty.** |
+| Input (category A) | `A_input` | Users upload input files here. |
+| Mapping (category A) | `A_mapping` | CSV copy of the lookup tables (written by the app). |
+| Output (category A) | `A_output` | Computed workbooks + the comparison workbook. |
+| Template (category A) | `A_template` | Copy of each computed workbook. |
 
-You can start with just category **A**'s four folders and add the rest later.
+Start with **category A only** (5 folders total). Add `B_input`…`B_template` etc. later
+when you're ready for more categories.
 
-Then set a **project variable** so the backend can find the config folder:
+**How to find a folder's ID:** open the folder — the URL looks like
+`…/managedfolder/`**`aB3dK9Zx`**`/view`. That 8-character code is the ID. (Also shown under
+the folder's **Settings** tab.)
+
+---
+
+## Step 2 — Point the backend at the config folder
+
+Top bar → **⋮ (More)** → **Variables** (or **Project → Settings → Variables**).
+In the **project variables** JSON, add the config folder's ID:
 
 ```json
-{ "WEBAPP_CONFIG_FOLDER": "<id of the config managed folder>" }
+{
+    "WEBAPP_CONFIG_FOLDER": "aB3dK9Zx"
+}
 ```
 
-(Project → Settings → Variables. Alternatively hard-wire `CONFIG_FOLDER_FALLBACK` at the
-top of `python-lib/webapp_core/config_store.py`.)
+Save. (If variables already exist, just add that one key.)
 
-## 2. Add the backend library
+---
 
-Copy `webapp/python-lib/webapp_core/` into the project's **python-lib/** folder
-(Project → Libraries → `python-lib`), so `backend.py` can `import webapp_core`.
+## Step 3 — Check the code environment
 
-Code-env packages required: `pandas`, `numpy`, `openpyxl`, and `xlrd` (only for reading
-legacy `.xls` inputs). Flask is already present in the webapp backend env.
+The backend needs `pandas`, `numpy`, `openpyxl` (all in the Dataiku default Python env),
+plus **`xlrd`** *only if* you want to accept legacy `.xls` inputs. If you need `xlrd`:
+**Administration → Code envs →** your Python env **→ Packages to install →** add `xlrd` →
+**Update**. Note which env it is; you'll select it in Step 4.
 
-## 3. Create the webapp
+---
 
-New webapp → **Standard** → enable the **Python backend**. Paste the four panes. In the
-backend settings grant read/write access to every managed folder listed above.
+## Step 4 — Create the webapp
 
-### Pages / navigation
+1. **+ New → Webapp → Standard → "Empty (code your own)"**. Name it e.g. *Category
+   Formula Studio*.
+2. It opens with four editable panes: **HTML, CSS, JS, Python (Backend)**.
+   Make sure **"This web app has a Python backend"** is enabled (Settings tab).
+3. Paste:
+   * `body.html` → **HTML**
+   * `style.css` → **CSS**
+   * `app.js` → **JS**
+   * `backend_single.py` → **Python / Backend**
+4. **Settings → Python backend → Code env**: pick the env from Step 3 (if you added
+   `xlrd`), otherwise leave the default.
+5. **Settings → Security / Connections**: grant the webapp access to the managed folders
+   (it needs read/write on all of them). If your instance doesn't require this, skip it.
+6. Click **Save**, then **Start / Restart backend** (top of the Python pane).
+7. Click **View web app**.
 
-The front end is hash-routed, so each screen is a real, linkable page and the browser
-Back/Forward buttons and refresh all work:
+### Pages (hash-routed — Back button and refresh work)
 
-| Route | Page |
+| URL | Page |
 |---|---|
-| `#/` | Categories — just the thumbnail grid (the landing page) |
-| `#/c/<id>` | One category — the Upload → Validate → Compute → Outputs → Compare stepper |
-| `#/admin` / `#/admin/<id>` | Admin console (folders, sample, recipe, settings) |
+| `#/` | Categories — the thumbnail grid (landing page) |
+| `#/c/A` | Category A — Upload → Validate → Compute → Outputs → Compare |
+| `#/admin` | Admin console |
 
-## 4. First run
+---
 
-1. Open the webapp. Click **Admin** → sign in with `admin` / `changeme`.
-2. You are forced to the **Settings** tab — set a real username/password.
-3. Pick category **A**:
-   * **Managed folders** – paste the four folder ids (the dropdown lists project folders).
-   * **Sample workbook** – upload the sample `.xlsx` (data sheet + mapping/lookup sheets).
-     The app auto-detects the header row, the formula (computed) columns, the lookup
-     sheets and any toggle names used in the formulas.
-   * Review the generated **recipe**: fix any Python/pandas expression the translator
-     flagged, set toggle values (Yes/No, constant for the category), add **comparison
-     rules** (`computed column` vs `another column`, numeric tolerance or text).
-   * **Save recipe.** Unresolved references are reported; confirm to save anyway.
-4. Back on the home page category **A** shows **Ready**. Open it and use the stepper:
-   **Upload** input files → **Validate** (exact schema match on the non-computed columns)
-   → **Compute** → **Outputs** (download / delete / clear-all) → **Compare** (one
-   consolidated workbook with `Summary`, `Matched`, `Mismatched`).
+## Step 5 — First sign-in (in the webapp)
 
-## How formulas are handled
+1. Click **Admin** (top-right) → sign in with **`admin`** / **`changeme`**.
+2. You're sent to the **⚙ Settings** tab and asked to change the credentials:
+   *Current password* = `changeme`, set a new username (optional) and a new password
+   (min 6 chars) → **Update**.
+3. Sign in again with the new credentials.
 
-* The sample's computed columns must contain real Excel formulas. Each is *generalized*
-  (the data row number becomes `{r}`) and stored two ways:
-  * `excel_formula` — written verbatim into **every** output row (`{r}` → the real row),
-    so the output `.xlsx` recalculates live in Excel.
-  * `pandas_expr` — a translation used to compute values for the comparison step. Edit it
-    in the Admin UI if the auto-translation is imperfect.
-* Lookup/mapping sheets are stored in the recipe and re-embedded as extra sheets in every
-  output workbook (so `VLOOKUP(... Rates!$A$2:$B$4 ...)` keeps working), and mirrored as
-  CSV into the mapping folder.
-* Toggles become a `Parameters` sheet in each output and a `PARAM('Name')` value in the
-  pandas expression.
+---
+
+## Step 6 — Set up category A
+
+Click the **A** tab in the Admin console.
+
+1. **Name** – optionally rename "A" to a real name → **Save name**.
+2. **Managed folders** – type or pick the four folder IDs (`A_input`, `A_mapping`,
+   `A_output`, `A_template`) → **Save folders**.
+3. **Sample workbook** – choose your sample `.xlsx` → **Analyse sample**. The app:
+   * finds the data sheet and header row (data can start on any row);
+   * lists the **input columns** (everything not driven by a formula) — this becomes the
+     exact-match schema for uploads;
+   * lists the **computed columns** with their Excel formula and a suggested Python/pandas
+     expression — **review each expression** and fix it if the note flags something;
+   * shows the **lookup tables** it pulled from the other sheets;
+   * proposes **toggles** for any name in a formula that isn't a column or a lookup — set
+     each to **Yes** or **No** (constant for the category).
+4. **Comparison rules** – add one row per check: **left** = a computed column, **right** =
+   the column to compare it against, **type** = numeric (with a tolerance) or text.
+5. **Save recipe.** If it reports unresolved references, read them and either fix the
+   recipe or confirm to save anyway.
+
+Back on **Categories**, card **A** now shows a green **Ready** badge.
+
+---
+
+## Step 7 — Use it (any user)
+
+Open category **A** from the home page and follow the stepper:
+
+1. **Upload** – drag in `.xlsx/.xls/.csv` input files.
+2. **Validate** – each file is checked against the exact input-column schema.
+3. **Compute** – valid files become `<name>__computed.xlsx` in the output **and** template
+   folders; computed columns contain the **live Excel formula** in every row, and the
+   lookup tables are embedded as extra sheets.
+4. **Outputs** – download or delete individual files; **Clear all** to empty a folder.
+5. **Compare** – produces one `comparison__<timestamp>.xlsx` (Summary / Matched /
+   Mismatched) in the output folder.
+
+---
+
+## Adding more categories later
+
+Create that category's four folders (Step 1), then in the Admin page open its tab and do
+Step 6. Renaming is in the same tab. The category list itself is fixed at 9 (A–I); rename
+the ones you use and ignore the rest.
+
+---
 
 ## Local development / tests
 
 ```bash
 cd webapp
 pip install pandas numpy openpyxl pytest flask
-python -m pytest -q
+python -m pytest -q          # 15 tests
+python build_single.py       # regenerate backend_single.py after editing modules
 ```
 
-The core modules (`sample_parser`, `formula_translate`, `compute`, `compare`) have no
-`dataiku` dependency. `config_store` / `backend` fall back to a local directory tree under
-`./_webapp_local` when `dataiku` is not importable, so `backend.app` can be exercised with
-Flask's test client (see `tests/` and the pattern in the plan's verification section).
+`sample_parser`, `formula_translate`, `compute`, `compare` have no `dataiku` dependency.
+`config_store` / the backend fall back to a local `./_webapp_local` directory when
+`dataiku` isn't importable, so `app` can be driven with Flask's test client.
