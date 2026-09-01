@@ -1,0 +1,135 @@
+<div id="app">
+  <header class="topbar">
+    <div class="brand" id="brand-home">
+      <span class="brand-mark">◧</span>
+      <span class="brand-text">Category Formula Studio</span>
+    </div>
+    <nav class="topnav">
+      <button class="link-btn" id="nav-home">Categories</button>
+      <button class="link-btn" id="nav-admin">Admin</button>
+    </nav>
+  </header>
+
+  <main class="content">
+    <!-- ===================== HOME ===================== -->
+    <section id="view-home" class="view">
+      <div class="view-head">
+        <h1>Categories</h1>
+        <p class="muted">Pick a category to upload input files, run computations and compare results.</p>
+      </div>
+      <div id="cat-grid" class="cat-grid"></div>
+    </section>
+
+    <!-- ===================== CATEGORY ===================== -->
+    <section id="view-category" class="view hidden">
+      <button class="link-btn back" id="cat-back">← All categories</button>
+      <div class="view-head">
+        <h1 id="cat-title">Category</h1>
+        <p class="muted" id="cat-sub"></p>
+      </div>
+
+      <ol class="stepper" id="stepper">
+        <li data-step="1" class="active">Upload</li>
+        <li data-step="2">Validate</li>
+        <li data-step="3">Compute</li>
+        <li data-step="4">Outputs</li>
+        <li data-step="5">Compare</li>
+      </ol>
+
+      <div class="step-panel" id="step-1">
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="file-input" multiple hidden accept=".xlsx,.xls,.csv">
+          <p><strong>Drop input files here</strong> or <button class="link-btn" id="browse-btn">browse</button></p>
+          <p class="muted small">.xlsx, .xls or .csv — schema must match the category's non-computed columns exactly.</p>
+        </div>
+        <div class="table-wrap"><table id="input-table"><thead><tr><th>File</th><th></th></tr></thead><tbody></tbody></table></div>
+        <div class="row-actions">
+          <button class="btn ghost danger" id="clear-inputs">Clear all inputs</button>
+          <button class="btn" id="to-validate">Validate files →</button>
+        </div>
+      </div>
+
+      <div class="step-panel hidden" id="step-2">
+        <div class="table-wrap"><table id="validate-table">
+          <thead><tr><th>File</th><th>Header row</th><th>Rows</th><th>Status</th><th>Detail</th></tr></thead>
+          <tbody></tbody></table></div>
+        <div class="row-actions">
+          <button class="btn ghost" data-goto="1">← Back</button>
+          <button class="btn" id="to-compute">Run computations →</button>
+        </div>
+      </div>
+
+      <div class="step-panel hidden" id="step-3">
+        <div id="compute-status" class="muted">Ready.</div>
+        <div class="table-wrap"><table id="compute-table">
+          <thead><tr><th>File</th><th>Status</th><th>Output</th><th>Rows</th><th>Notes</th></tr></thead>
+          <tbody></tbody></table></div>
+        <div class="row-actions">
+          <button class="btn ghost" data-goto="2">← Back</button>
+          <button class="btn" data-goto="4">See outputs →</button>
+        </div>
+      </div>
+
+      <div class="step-panel hidden" id="step-4">
+        <div class="output-cols">
+          <div class="output-card">
+            <h3>Computed outputs</h3>
+            <div class="table-wrap"><table id="output-table"><thead><tr><th>File</th><th></th></tr></thead><tbody></tbody></table></div>
+            <button class="btn ghost danger small" data-clear="output">Clear all outputs</button>
+          </div>
+          <div class="output-card">
+            <h3>Templates</h3>
+            <div class="table-wrap"><table id="template-table"><thead><tr><th>File</th><th></th></tr></thead><tbody></tbody></table></div>
+            <button class="btn ghost danger small" data-clear="template">Clear all templates</button>
+          </div>
+        </div>
+        <div class="row-actions">
+          <button class="btn ghost" data-goto="3">← Back</button>
+          <button class="btn" id="to-compare">Run comparison →</button>
+        </div>
+      </div>
+
+      <div class="step-panel hidden" id="step-5">
+        <div id="compare-status" class="muted">Compares configured column pairs on every row of every computed output.</div>
+        <div class="table-wrap"><table id="compare-summary">
+          <thead><tr><th>File</th><th>Rows</th><th>Matched</th><th>Mismatched</th><th>Findings</th></tr></thead>
+          <tbody></tbody></table></div>
+        <div id="compare-download"></div>
+        <div class="row-actions"><button class="btn ghost" data-goto="4">← Back</button></div>
+      </div>
+    </section>
+
+    <!-- ===================== ADMIN ===================== -->
+    <section id="view-admin" class="view hidden">
+      <button class="link-btn back" id="admin-back">← All categories</button>
+
+      <div id="admin-login" class="card narrow">
+        <h2>Admin sign in</h2>
+        <label>Username <input type="text" id="login-user" autocomplete="username"></label>
+        <label>Password <input type="password" id="login-pass" autocomplete="current-password"></label>
+        <button class="btn" id="login-btn">Sign in</button>
+        <p class="err" id="login-err"></p>
+      </div>
+
+      <div id="admin-panel" class="hidden">
+        <div class="view-head"><h1>Administration</h1>
+          <p class="muted">Wire folders, upload a sample workbook, review the generated recipe.</p></div>
+        <div class="admin-tabs" id="admin-tabs"></div>
+        <div id="admin-tab-body"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast-wrap" id="toast-wrap"></div>
+
+  <div class="modal-backdrop hidden" id="modal">
+    <div class="modal">
+      <h3 id="modal-title">Confirm</h3>
+      <p id="modal-body"></p>
+      <div class="row-actions">
+        <button class="btn ghost" id="modal-cancel">Cancel</button>
+        <button class="btn danger" id="modal-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
