@@ -54,6 +54,36 @@
     setTimeout(() => t.remove(), 4200);
   }
 
+  // Compact multi-select dropdown. Returns the wrapper element; call ._get() for the
+  // ordered list of checked values (order follows `options`).
+  function multiSelect(options, selected) {
+    const chosen = new Set(selected || []);
+    const btn = el("button", { type: "button", class: "msel-btn" });
+    const panel = el("div", { class: "msel-panel hidden" });
+    options.forEach((o) => {
+      const cb = el("input", { type: "checkbox" });
+      cb.checked = chosen.has(o);
+      cb.addEventListener("change", () => { cb.checked ? chosen.add(o) : chosen.delete(o); paint(); });
+      panel.appendChild(el("label", { class: "msel-opt" }, [cb, el("span", { text: o })]));
+    });
+    function paint() {
+      const arr = options.filter((o) => chosen.has(o));
+      btn.textContent = arr.length ? arr.join(", ") : "Select columns";
+      btn.classList.toggle("placeholder", !arr.length);
+    }
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const wasOpen = !panel.classList.contains("hidden");
+      $$(".msel-panel").forEach((p) => p.classList.add("hidden"));
+      panel.classList.toggle("hidden", wasOpen);
+    });
+    const wrap = el("div", { class: "msel" }, [btn, panel]);
+    document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) panel.classList.add("hidden"); });
+    paint();
+    wrap._get = () => options.filter((o) => chosen.has(o));
+    return wrap;
+  }
+
   function confirmModal(title, body) {
     return new Promise((resolve) => {
       $("#modal-title").textContent = title;
@@ -464,22 +494,25 @@
     box.appendChild(el("button", { class: "btn ghost small", text: "+ toggle", onclick: () => addToggleRow() }));
 
     // comparison rules
-    box.appendChild(el("h4", { text: "Comparison rules (column vs column, same row)" }));
+    box.appendChild(el("h4", { text: "Comparison rules (columns vs columns, same row)" }));
+    box.appendChild(el("p", { class: "muted small", text: "Pick one or more columns on each side. Columns are compared position-by-position (1st ↔ 1st, 2nd ↔ 2nd …); pick a single column on one side to compare it against several on the other. A row is 'matched' only if every pair agrees." }));
     const cmpWrap = el("div", {});
+    const asArr = (v) => Array.isArray(v) ? v.slice() : (v ? [v] : []);
     function addCmpRow(r) {
-      const left = el("select", {}, allCols().map((c) => el("option", { value: c, text: c })));
-      const right = el("select", {}, allCols().map((c) => el("option", { value: c, text: c })));
+      const left = multiSelect(allCols(), asArr(r && r.left));
+      const right = multiSelect(allCols(), asArr(r && r.right));
       const type = el("select", {}, [el("option", { value: "numeric", text: "numeric" }), el("option", { value: "text", text: "text" })]);
       const tol = el("input", { type: "text", value: (r && r.tolerance != null) ? r.tolerance : "0", placeholder: "tolerance" });
-      if (r) { left.value = r.left; right.value = r.right; type.value = r.type || "numeric"; }
-      const row = el("div", { class: "grid-2", "data-cmp": "1" }, [
-        el("div", {}, [el("label", { text: "left (computed)" }), left]),
-        el("div", {}, [el("label", { text: "right" }), right]),
+      if (r) { type.value = r.type || "numeric"; }
+      const row = el("div", { class: "cmp-row", "data-cmp": "1" }, [
+        el("div", {}, [el("label", { text: "left column(s)" }), left]),
+        el("div", {}, [el("label", { text: "right column(s)" }), right]),
         el("div", {}, [el("label", { text: "type" }), type]),
-        el("div", {}, [el("label", { text: "num. tolerance" }), tol,
-          el("button", { class: "icon-btn", text: "✕", onclick: () => row.remove() })]),
+        el("div", {}, [el("label", { text: "num. tolerance" }), tol]),
+        el("div", { class: "cmp-rm" }, [
+          el("button", { class: "icon-btn", title: "Remove rule", text: "✕", onclick: () => row.remove() })]),
       ]);
-      row._get = () => ({ left: left.value, right: right.value, type: type.value, tolerance: parseFloat(tol.value) || 0 });
+      row._get = () => ({ left: left._get(), right: right._get(), type: type.value, tolerance: parseFloat(tol.value) || 0 });
       cmpWrap.appendChild(row);
     }
     (a.comparison || []).forEach(addCmpRow);
@@ -498,7 +531,8 @@
       pandas_expr: ($(`[data-cc-expr="${i}"]`, box) || {}).value || c.pandas_expr,
     }));
     const toggles = $$("[data-toggle]", box).map((r) => r._get()).filter((t) => t.name);
-    const comparison = $$("[data-cmp]", box).map((r) => r._get()).filter((r) => r.left && r.right);
+    const comparison = $$("[data-cmp]", box).map((r) => r._get())
+      .filter((r) => r.left.length && r.right.length);
     const payload = {
       recipe: {
         data_sheet: ($("#an-datasheet", box) || {}).value || a.data_sheet,
