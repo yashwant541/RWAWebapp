@@ -19,6 +19,7 @@ from openpyxl.utils import get_column_letter
 from .sample_parser import detect_header_row, _headers_from_row, _norm, col_letter_to_index
 
 _A1_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?(\d+)$")
+_TOK_RE = re.compile(r"\{tok:([^}]+)\}")
 
 
 # --------------------------------------------------------------------------- input IO
@@ -345,14 +346,21 @@ def ISERROR(x):
 
 
 # ------------------------------------------------------------------------- evaluate
-def _toggle_value(raw: Any) -> Any:
-    if isinstance(raw, str):
-        low = raw.strip().lower()
-        if low in ("yes", "true", "y", "1"):
-            return True
-        if low in ("no", "false", "n", "0", ""):
-            return False
-    return raw
+class ToggleValue(str):
+    """A toggle's value, usable both ways a formula might use it:
+
+    * as text - ``IF($AB$2="Yes", ...)`` -> ``PARAM('X') == 'Yes'`` (plain string equality,
+      since this *is* a ``str``), and
+    * as a boolean - ``IF(IncludeTax, ...)`` -> ``IF(PARAM('X'), ...)`` (truthy only for
+      Yes/True/Y/1, via the overridden ``__bool__``).
+    """
+
+    def __bool__(self) -> bool:
+        return self.strip().lower() in ("yes", "true", "y", "1")
+
+
+def _toggle_value(raw: Any) -> ToggleValue:
+    return ToggleValue("" if raw is None else str(raw))
 
 
 def evaluate(df: pd.DataFrame, recipe: Dict[str, Any],
@@ -421,6 +429,16 @@ def build_workbook(values_df: pd.DataFrame, recipe: Dict[str, Any],
     lookups = lookups or Lookups({})
     cols = [c for c in ordered_columns(recipe) if c in values_df.columns] or list(values_df.columns)
     computed_by_name = {c["name"]: c for c in recipe.get("computed_columns", [])}
+    # a computed formula's {tok:Name} placeholders (see sample_parser's fixed-cell
+    # detection) point at whichever row that toggle ends up on in the Parameters sheet.
+    toggle_row = {t["name"]: i + 2 for i, t in enumerate(recipe.get("toggles", []))}
+
+    def _resolve_tokens(formula: str) -> str:
+        return _TOK_RE.sub(
+            lambda m: f"Parameters!$B${toggle_row[m.group(1)]}"
+            if m.group(1) in toggle_row else "FALSE()",
+            formula,
+        )
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -432,7 +450,9 @@ def build_workbook(values_df: pd.DataFrame, recipe: Dict[str, Any],
         for c in cols:
             if c in computed_by_name:
                 formula = computed_by_name[c].get("excel_formula", "")
-                out_row.append(formula.replace("{r}", str(excel_row)) if formula else row.get(c))
+                if formula:
+                    formula = _resolve_tokens(formula.replace("{r}", str(excel_row)))
+                out_row.append(formula if formula else row.get(c))
             else:
                 val = row.get(c)
                 out_row.append(None if (isinstance(val, float) and np.isnan(val)) else val)

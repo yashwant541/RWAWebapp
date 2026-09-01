@@ -22,6 +22,7 @@ _TOKEN_SPEC = [
     ("STRING", r'"(?:[^"]|"")*"'),
     ("SHEETRANGE", r"(?:'[^']+'|[A-Za-z_][A-Za-z0-9_ ]*)!\$?[A-Za-z]{1,3}\$?\d+:\$?[A-Za-z]{1,3}\$?\d+"),
     ("SHEETCELL", r"(?:'[^']+'|[A-Za-z_][A-Za-z0-9_ ]*)!\$?[A-Za-z]{1,3}\$?\d+"),
+    ("TOKREF", r"\{tok:[^}]*\}"),
     ("RELCELL", r"\$?[A-Za-z]{1,3}\{r\}"),
     ("ABSCELL", r"\$?[A-Za-z]{1,3}\$?\d+"),
     ("NUMBER", r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"),
@@ -171,6 +172,10 @@ class _Parser:
             return repr(raw)
         if t.kind == "FUNC":
             return self._funccall()
+        if t.kind == "TOKREF":
+            raw = self._next().val
+            name = raw[len("{tok:"): -1]
+            return f"PARAM({name!r})"
         if t.kind == "RELCELL":
             letter = self._next().val.split("{")[0].replace("$", "").upper()
             col = self.headers.get(letter)

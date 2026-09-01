@@ -483,14 +483,21 @@
 
     // toggles
     box.appendChild(el("h4", { text: "Toggles (constant Yes/No values used in formulas)" }));
+    box.appendChild(el("p", { class: "muted small", text: "A toggle can come from a bare word in a formula (e.g. IF(IncludeTax,...)) or from a single fixed cell elsewhere on the sheet (e.g. IF($AB$2=\"Yes\",...), shown below with its cell reference). Rename freely — formulas keep pointing at it by this name." }));
     const togWrap = el("div", {});
     function addToggleRow(t) {
       const nm = el("input", { type: "text", value: (t && t.name) || "", placeholder: "toggle name" });
       const vl = el("select", {}, [el("option", { value: "Yes", text: "Yes" }), el("option", { value: "No", text: "No" })]);
+      if (t && t.value && !["Yes", "No"].includes(t.value)) {
+        vl.appendChild(el("option", { value: t.value, text: t.value }));
+      }
       if (t && t.value) vl.value = t.value;
-      const row = el("div", { class: "grid-2", "data-toggle": "1" }, [nm, el("div", {}, [vl,
-        el("button", { class: "icon-btn", text: "✕", onclick: () => row.remove() })])]);
-      row._get = () => ({ name: nm.value.trim(), value: vl.value });
+      const cellNote = (t && t.cell) ? el("span", { class: "muted small", text: ` (cell ${t.cell})` }) : el("span", {});
+      const row = el("div", { class: "grid-2", "data-toggle": "1" }, [
+        el("div", {}, [nm, cellNote]),
+        el("div", {}, [vl, el("button", { class: "icon-btn", text: "✕", onclick: () => row.remove() })]),
+      ]);
+      row._get = () => ({ name: nm.value.trim(), value: vl.value, cell: t && t.cell });
       togWrap.appendChild(row);
     }
     (a.toggles || []).forEach(addToggleRow);

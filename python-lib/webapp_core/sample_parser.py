@@ -24,6 +24,12 @@ from . import formula_translate
 MAX_SCAN_ROWS = 40
 _CELL_RE = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)(\d+)")
 _SHEET_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_ ]*))!")
+# A sheet-qualified single cell OR range (e.g. "Rates!$A$2" / "Rates!$A$2:$B$4") - matched
+# as one unit so range-generalisation never mistakes the range's second cell for a
+# same-sheet "fixed cell" (see generalize_formula).
+_SHEET_QUALIFIED_RE = re.compile(
+    _SHEET_REF_RE.pattern + _CELL_RE.pattern + r"(?::" + _CELL_RE.pattern + r")?"
+)
 _FUNC_RE = re.compile(r"([A-Za-z][A-Za-z0-9_.]*)\s*\(")
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -116,13 +122,18 @@ def _headers_from_row(row: List[Any]) -> List[str]:
 
 
 # ------------------------------------------------------------------- formula tools
+_TOK_PLACEHOLDER_RE = re.compile(r"\{tok:[^}]*\}")
+
+
 def extract_refs(formula: str) -> Dict[str, List[str]]:
     """Split a formula into referenced sheet names, function names and bare tokens."""
     sheets = sorted({m.group(1) or m.group(2) for m in _SHEET_REF_RE.finditer(formula)})
     funcs = sorted({m.group(1).upper() for m in _FUNC_RE.finditer(formula)})
-    # Strip string literals and sheet-qualified refs before scanning bare tokens.
+    # Strip string literals, sheet-qualified refs and {tok:...} placeholders before
+    # scanning bare tokens (a placeholder's own text must not look like a new token).
     stripped = re.sub(r'"[^"]*"', "", formula)
     stripped = _SHEET_REF_RE.sub("", stripped)
+    stripped = _TOK_PLACEHOLDER_RE.sub("", stripped)
     stripped = _CELL_RE.sub("", stripped)
     tokens = sorted(
         {
@@ -133,19 +144,27 @@ def extract_refs(formula: str) -> Dict[str, List[str]]:
     return {"sheets": sheets, "funcs": funcs, "tokens": tokens}
 
 
-def generalize_formula(formula: str, row: int, header_letters: Dict[str, str]) -> str:
+def generalize_formula(
+    formula: str, row: int, header_letters: Dict[str, str],
+    fixed_cell_hook: Optional[Any] = None,
+) -> str:
     """Replace same-sheet cell refs on ``row`` with the ``{r}`` placeholder.
 
-    ``A5`` on row 5 -> ``A{r}``; absolute ``$A$5`` and other-sheet refs are left alone
-    so they stay constant across rows.
+    ``A5`` on row 5 -> ``A{r}``. Any other same-sheet cell ref - an absolute ``$A$5``, or
+    a plain ref that points at a different row (a stray look-elsewhere reference) - is
+    "fixed": it stays constant across rows, so it can't become ``{r}``. Such a ref is
+    typically a single labelled parameter/toggle cell placed elsewhere on the sheet
+    (e.g. ``IF($AB$2="Yes", ...)``). By default it is left as-is; pass ``fixed_cell_hook``
+    (called with ``(raw_text, col_letters, row_num)``) to substitute something else, e.g.
+    a ``{tok:Name}`` placeholder once that cell has been registered as a toggle.
+    Other-sheet refs are always left alone.
     """
     def repl(m: re.Match) -> str:
         dollar_col, col, dollar_row, rownum = m.groups()
-        # Leave alone if it is part of a sheet-qualified ref (handled by caller context).
-        if dollar_row == "$":
-            return m.group(0)
-        if int(rownum) == row:
+        if dollar_row != "$" and int(rownum) == row:
             return f"{dollar_col}{col}{{r}}"
+        if fixed_cell_hook:
+            return fixed_cell_hook(m.group(0), col.upper(), int(rownum))
         return m.group(0)
 
     # Protect sheet-qualified refs from row generalisation.
@@ -156,11 +175,30 @@ def generalize_formula(formula: str, row: int, header_letters: Dict[str, str]) -
         placeholders[key] = m.group(0)
         return key
 
-    protected = re.sub(_SHEET_REF_RE.pattern + _CELL_RE.pattern, stash, formula)
+    protected = _SHEET_QUALIFIED_RE.sub(stash, formula)
     generalized = _CELL_RE.sub(repl, protected)
     for key, val in placeholders.items():
         generalized = generalized.replace(key, val)
     return generalized
+
+
+def _guess_cell_label(ws_v, row_num: int, col_idx: int) -> Optional[str]:
+    """A fixed cell is usually a value next to a text label - e.g. 'Include Tax' in the
+    cell to its left, or above it. Used to name the toggle after that label."""
+    candidates = []
+    if col_idx > 0:
+        candidates.append(ws_v.cell(row=row_num, column=col_idx).value)  # left neighbour
+    if row_num > 1:
+        candidates.append(ws_v.cell(row=row_num - 1, column=col_idx + 1).value)  # above
+    for v in candidates:
+        if _looks_like_label(v):
+            return _norm(v)
+    return None
+
+
+def _guess_toggle_value(raw: Any) -> str:
+    s = _norm(raw).lower()
+    return "Yes" if s in ("yes", "true", "y", "1") else "No"
 
 
 # ------------------------------------------------------------------------- analyse
@@ -203,22 +241,59 @@ def analyze_sample(file_bytes: bytes, data_sheet: Optional[str] = None) -> Dict[
         raise ValueError(f"Data sheet '{ds_name}' is empty.")
 
     header_row = detect_header_row(vrows)
-    headers = _headers_from_row(frows[header_row])
-    letter_by_header = {h: col_index_to_letter(j) for j, h in enumerate(headers)}
-    header_by_letter = {col_index_to_letter(j): h for j, h in enumerate(headers)}
-
     first_data = header_row + 1
     if first_data >= len(frows):
         raise ValueError(f"Data sheet '{ds_name}' has a header but no data rows.")
 
-    # 2. classify columns
+    # Keep only columns that are actually part of the table: a header label, or data
+    # underneath it. openpyxl pads every row out to the sheet's overall max_column, so
+    # without this a cell placed far to the right (e.g. a toggle at $AB$2) would drag in
+    # dozens of blank "ColumnF".."ColumnAB" placeholders as bogus canonical columns.
+    raw_header_row = frows[header_row]
+
+    def _col_has_data(j: int) -> bool:
+        return any(j < len(r) and _norm(r[j]) for r in frows[first_data:])
+
+    kept = [j for j in range(len(raw_header_row))
+           if _norm(raw_header_row[j]) or _col_has_data(j)]
+    headers = _headers_from_row([raw_header_row[j] for j in kept])
+    letter_by_header = {h: col_index_to_letter(kept[i]) for i, h in enumerate(headers)}
+    header_by_letter = {col_index_to_letter(kept[i]): h for i, h in enumerate(headers)}
+
+    # 2. classify columns. A same-sheet cell ref that formulas can't turn into {r} (see
+    # generalize_formula) is registered once as a "fixed cell" -> proposed as a toggle,
+    # named after a neighbouring label, and templated into the formula as {tok:Name} so
+    # it survives both the pandas translation and rebuilding the live Excel formula.
+    fixed_cells: Dict[str, Dict[str, Any]] = {}   # address ("AB2") -> toggle dict
+    used_names: Dict[str, str] = {}               # toggle name already taken -> address
+
+    def _fixed_cell_hook(raw_text: str, col_letters: str, row_num: int) -> str:
+        addr = f"{col_letters}{row_num}"
+        if addr not in fixed_cells:
+            col_idx = col_letter_to_index(col_letters)
+            try:
+                raw_value = ws_v.cell(row=row_num, column=col_idx + 1).value
+            except Exception:  # noqa: BLE001
+                raw_value = None
+            name = _guess_cell_label(ws_v, row_num, col_idx) or f"Cell {addr}"
+            base, n = name, 2
+            while used_names.get(name, addr) != addr:
+                name = f"{base} ({n})"
+                n += 1
+            used_names[name] = addr
+            fixed_cells[addr] = {
+                "name": name, "cell": addr, "value": _guess_toggle_value(raw_value),
+            }
+        return "{tok:%s}" % fixed_cells[addr]["name"]
+
     canonical: List[str] = []
     computed: List[Dict[str, Any]] = []
     for j, name in enumerate(headers):
+        orig_j = kept[j]
         formula_cell = None
         formula_excel_row = None
         for ridx in range(first_data, len(frows)):
-            val = frows[ridx][j] if j < len(frows[ridx]) else None
+            val = frows[ridx][orig_j] if orig_j < len(frows[ridx]) else None
             if isinstance(val, str) and val.startswith("="):
                 formula_cell = val
                 formula_excel_row = ridx + 1  # openpyxl rows are 1-based
@@ -226,7 +301,9 @@ def analyze_sample(file_bytes: bytes, data_sheet: Optional[str] = None) -> Dict[
         if formula_cell is None:
             canonical.append(name)
             continue
-        generalized = generalize_formula(formula_cell, formula_excel_row, letter_by_header)
+        generalized = generalize_formula(
+            formula_cell, formula_excel_row, letter_by_header, _fixed_cell_hook
+        )
         pandas_expr, xl_notes = formula_translate.translate(
             generalized, header_by_letter
         )
@@ -271,10 +348,13 @@ def analyze_sample(file_bytes: bytes, data_sheet: Optional[str] = None) -> Dict[
         )
     lookup_sheet_names = {l["sheet"] for l in lookups}
 
-    # 4. unresolved tokens -> toggle candidates
+    # 4. unresolved bare-word tokens -> toggle candidates, merged with the fixed-cell
+    # toggles found while generalizing the formulas (step 2, above).
     canon_lower = {c.lower() for c in canonical}
     comp_lower = {c["name"].lower() for c in computed}
-    toggles: List[str] = []
+    toggle_defs: Dict[str, Dict[str, Any]] = {
+        info["name"]: info for info in fixed_cells.values()
+    }
     for c in computed:
         for tok in c["refs"]["tokens"]:
             tl = tok.lower()
@@ -282,8 +362,8 @@ def analyze_sample(file_bytes: bytes, data_sheet: Optional[str] = None) -> Dict[
                 continue
             if tok in lookup_sheet_names:
                 continue
-            if tok not in toggles:
-                toggles.append(tok)
+            if tok not in toggle_defs:
+                toggle_defs[tok] = {"name": tok, "value": "Yes"}
         for sh in c["refs"]["sheets"]:
             if sh not in lookup_sheet_names:
                 warnings.append(
@@ -307,7 +387,7 @@ def analyze_sample(file_bytes: bytes, data_sheet: Optional[str] = None) -> Dict[
         "canonical_schema": canonical,
         "computed_columns": computed,
         "lookups": lookups,
-        "toggles": [{"name": t, "value": "Yes"} for t in toggles],
+        "toggles": list(toggle_defs.values()),
         "warnings": warnings,
     }
 
